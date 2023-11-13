@@ -1,0 +1,1931 @@
+---
+title: "qc_batchadj.Rmd"
+author: "Euan McDonnell"
+date: '2023-01-20'
+output: html_document
+params:
+  study_id: "DW_E36_120123_Chondrogenesis"
+---
+
+
+### Libraries
+
+```{r}
+# Annotation, databases and pathways
+library(biomaRt)
+library(Biobase)
+library(org.Hs.eg.db)
+
+# Data manipulation
+library(reshape2)
+library(mgsub)
+
+# Statistics
+library(DESeq2)
+library(geva)
+library(factoextra)
+library(fgsea)
+library(pvca)
+library(clusterProfiler)
+library(sva)
+
+
+# Plotting & Colors
+library(colorspace)
+library(patchwork)
+library(ggnewscale)
+library(ggrepel)
+library(ComplexHeatmap)
+
+set.seed(123)
+
+
+```
+
+
+
+### Parameters
+
+```{r}
+
+# Which experiment
+study_id <- params$study_id
+
+# PVCA variance explained threshold
+varexpl_thr <- 0.7
+
+# Differential expression
+de_lrt.pval_thr <- 0.01
+de_padj_thr <- 0.01
+de_lfc_thr <- log2(1.5)
+
+# Ontology
+min_gs <- 5
+day0_sig_thr <- 0.05
+day3_sig_thr <- 0.05
+day7_sig_thr <- 0.05
+
+```
+
+
+
+### Directories
+
+```{r}
+
+# Define base directory
+base_dir <- paste0(getwd(), "/../")
+data_dir <- paste0(base_dir, study_id, "/data/")
+res_dir <- paste0(base_dir, study_id, "/results/")
+meta_dir <- paste0(data_dir, "metadata/")
+expr_dir <- paste0(data_dir, "expr/")
+qc_dir <- paste0(res_dir, "qc/")
+deseq_dir <- paste0(res_dir, "deseq2/")
+geva_dir <- paste0(res_dir, "geva/")
+pathway_dir <- paste0(res_dir, "pathway/")
+annot_dir <- paste0(data_dir, "annot/")
+script_dir <- paste0(base_dir, "extra_scripts/")
+
+# Make directories
+lapply(c(res_dir, meta_dir, expr_dir, qc_dir, geva_dir, deseq_dir, pathway_dir, annot_dir, script_dir), function(dir) { dir.create(dir, showWarnings = FALSE, recursive = TRUE) })
+
+```
+
+
+
+### Save session info
+
+```{r}
+
+# Save session info
+sink(paste0(base_dir, study_id, ".", Sys.Date(),".R_session_info.txt"))
+sessionInfo()
+sink()
+
+```
+
+
+
+### Source
+
+```{r}
+
+setwd(script_dir)
+for (script in list.files(pattern=".*.R", path=script_dir)) { source(script) }
+
+```
+
+
+
+### Read in data
+
+```{r}
+
+# Read in expression data
+setwd(expr_dir)
+txi <- readRDS(paste0(study_id,"_txi.RDS"))
+
+# Read in counts data
+setwd(meta_dir)
+metadata <- read.table("sample_metadata.tsv", sep="\t", header=TRUE)
+
+# Add columns for metadata
+metadata["Day"] <- gsub("_.*","",metadata$Condition)
+metadata["Treatment"] <- gsub(".*_","",metadata$Condition)
+metadata["Replicate"] <- gsub(".*_","",metadata$Sample)
+
+# Add patient/treatment colours
+metadata["TreatDonor"] <- paste(metadata$Donor, metadata$Treatment, sep="-")
+rownames(metadata) <- metadata$Sample
+
+```
+
+
+
+### Save expression matrices
+
+```{r}
+
+# Define filenames
+counts_filename <- paste0(expr_dir, "kallisto.counts_matrix.tsv")
+tpm_filename <- paste0(expr_dir, "kallisto.tpmexpr_matrix.tsv")
+txlengths_filename <- paste0(expr_dir, "kallisto.transcript_effectivelengths.tsv")
+
+# Save
+write.table(data.frame(GENE=rownames(txi$counts), txi$counts), counts_filename, sep="\t", row.names=FALSE, quote=FALSE)
+write.table(data.frame(GENE=rownames(txi$abundance), txi$abundance), tpm_filename, sep="\t", row.names=FALSE, quote=FALSE)
+write.table(data.frame(GENE=rownames(txi$length), txi$length), txlengths_filename, sep="\t", row.names=FALSE, quote=FALSE)
+
+```
+
+
+
+### Define colours
+
+Partial colourblind friendly, based off of Paul Tol's blog post: https://personal.sron.nl/~pault/
+
+```{r}
+
+# Day
+day_colors <- c("#FEE391", "#EC7014", "#662506")
+names(day_colors) <- c("Day0","Day3","Day7")
+
+# Donor
+donor_colors <- c("#0077BB","#009988","#EE3377")
+names(donor_colors) <- unique(metadata$Donor)
+
+# Treatment
+treat_colors <- c("#DDAA33","#004488")
+names(treat_colors) <- c("KD","Control")
+
+# Treat day colors
+condition_colors <- c(lighten("#FEE391",0.35),lighten("#EC7014",0.35), lighten("#662506",0.35), darken("#FEE391",0.25),darken("#EC7014",0.25), darken("#662506",0.25))
+names(condition_colors) <- unique(metadata$Condition)
+
+# Biotype colors
+bio_colors <- c("lncRNA"=lighten("darkred",0.5), "protein_coding"=lighten("darkblue",0.5), "pseudogene"=lighten("darkgreen",0.5))
+
+```
+
+
+
+### Get gene annotations
+
+# Directory
+cols <- c("ENSG","ENST","ENTZ","BIOTYPE","SYMBOL")
+biomart_filename <- paste0(annot_dir, "/", paste0(paste(cols, collapse="_"), ".kshv_viral_biomart.rds"))
+
+# Check if biomart exists
+if (file.exists(biomart_filename))
+{
+  # Read in biomart
+  biomart <- readRDS(biomart_filename)
+  
+} else {
+  
+  # Get biomart
+  httr::set_config(httr::config(ssl_verifypeer = FALSE))
+  ensembl <- useEnsembl(dataset="hsapiens_gene_ensembl",biomart='ensembl',host="https://feb2021.archive.ensembl.org/")
+
+  # Create biomart
+  # biomart <- AnnotationDbi::select(org.Hs.eg.db, keys=rownames(counts)[grepl("ENSG",rownames(counts))], columns=c("ENSEMBL","ENTREZID","SYMBOL","GENETYPE"), keytype="ENSEMBL")
+  biomart <- getBM(attributes=c("ensembl_gene_id_version","ensembl_transcript_id_version","entrezgene_id","gene_biotype","hgnc_symbol"), mart=ensembl)
+  colnames(biomart) <- cols; biomart$ENSG <- gsub("[.].*","",biomart$ENSG)
+  
+  # Remove version id
+  biomart$ENSG <- gsub("[.][0-9]*","",biomart$ENSG)
+  biomart <- biomart[!duplicated(biomart$ENSG),]
+  rownames(biomart) <- biomart$ENSG
+  colnames(biomart) <- cols
+  
+  # Sort out biotypes
+  biomart[grepl("pseudogene",biomart$BIOTYPE),]$BIOTYPE <- "pseudogene"
+  biomart[grepl("IG|Ig",biomart$BIOTYPE),]$BIOTYPE <- "Ig"
+  biomart[grepl("^TR_",biomart$BIOTYPE),]$BIOTYPE <- "TCR"
+  
+  # Replace missing symbols with names
+  biomart[biomart$SYMBOL == "",] <- biomart[biomart$SYMBOL == "",]$ENSG
+  
+  # Save as table
+  write.table(biomart, gsub("[.]rds",".tsv", biomart_filename), sep="\t")
+  
+  # Save as .rds
+  saveRDS(biomart, biomart_filename)
+}
+
+
+
+
+```{r}
+# Directory
+cols <- c("ENSEMBL","ENTREZID","GENETYPE","SYMBOL","GENENAME")
+gene_annot_filename <- paste0(annot_dir, "/", paste0(paste(cols, collapse="_"), ".gene_annot.rds"))
+
+# Check if gene_annot exists
+gene_annot <- AnnotationDbi::select(org.Hs.eg.db, keys=rownames(txi$counts), columns=c("ENSEMBL","ENTREZID","GENETYPE","SYMBOL","GENENAME"), keytype="ENSEMBL")
+gene_annot <- gene_annot[order(gene_annot$SYMBOL, decreasing=TRUE),]
+  
+# Remove version id
+colnames(gene_annot)[1] <- "ENSG"
+gene_annot <- gene_annot[!duplicated(gene_annot$ENSG),]
+
+# Replace missing symbols with names
+gene_annot[is.na(gene_annot$SYMBOL),] <- gene_annot[is.na(gene_annot$SYMBOL),]$ENSG
+rownames(gene_annot) <- gene_annot$ENSG
+  
+# Save as table
+write.table(gene_annot, gsub("[.]rds",".tsv", gene_annot_filename), sep="\t")
+  
+# Save as .rds
+saveRDS(gene_annot, gene_annot_filename)
+
+```
+
+
+
+### Level factors
+
+```{r}
+
+metadata$Day <- factor(metadata$Day, levels=sort(unique(metadata$Day)))
+metadata$TreatDonor <- factor(metadata$TreatDonor, levels=unique(metadata[order(metadata$Day, decreasing=FALSE),]$TreatDonor))
+
+```
+
+
+
+### Log2 data
+
+```{r}
+
+# Log2 data
+log2_counts <- log2(txi$counts + 1)
+log2.tpm_rcm <- log2(txi$abundance + 1)
+
+```
+
+
+
+### PCA
+
+```{r}
+
+# Run PCA
+unadj.pca_res <- prcomp(t(log2.tpm_rcm[matrixStats::rowVars(log2.tpm_rcm) > 0,]), scale=FALSE, center=TRUE)
+
+# Get variance
+unadj_var <- get_eigenvalue(unadj.pca_res)
+
+# Merge with metadata
+unadj_pca.metadata <- merge(metadata[,!grepl("PC",colnames(metadata))], unadj.pca_res$x, by.x="Sample", by.y="row.names")
+
+```
+
+
+
+### Screeplot
+
+```{r}
+
+# Make df
+var_expl.df <- data.frame(PC=colnames(unadj.pca_res$x), `VarExpl`=unadj_var$variance.percent)
+scr_plt <- ggplot(var_expl.df, aes(x=reorder(PC, VarExpl, decreasing=TRUE), y=VarExpl)) + 
+  geom_bar(stat="identity", fill=colorspace::lighten("darkblue",0.5)) + 
+  xlab("") + ylab("% Variance Explained") +
+  theme_bw() + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5))
+
+# Save
+setwd(qc_dir)
+ggsave("unadj_pca.var_explained.screeplot.png", scr_plt, units="px", width=3000, height=1000)
+
+```
+
+
+
+### Plot
+
+```{r}
+
+# Plot PCA
+## PC1 & 2
+### Treatment
+unadj.colbytreat.pc12_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(1,2), color_by="Treatment") + 
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC1, y=PC2, fill=Treatment, color=Treatment)) +
+  scale_fill_manual(values=treat_colors) + 
+  scale_color_manual(values=treat_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Donor
+unadj.colbydonor.pc12_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(1,2), color_by="Donor", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC1, y=PC2, fill=Donor, color=Donor)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=donor_colors) + 
+  scale_color_manual(values=donor_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Day
+unadj.colbyday.pc12_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(1,2), color_by="Day", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC1, y=PC2, fill=Day, color=Day)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=day_colors) + 
+  scale_color_manual(values=day_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Condition
+unadj.colbycond.pc12_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(1,2), color_by="Day", shape_by="Donor") +
+  new_scale_color() +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC1, y=PC2, fill=Condition), color="black", size=4.5) +
+  scale_shape_manual(values=c(21,23,25)) +
+  scale_fill_manual(values=condition_colors) + 
+  scale_color_manual(values=condition_colors) + 
+  theme(legend.position = "none", 
+        legend.title=element_blank(),
+        axis.title=element_text(32, face="bold")) 
+
+
+## PC2 & 3
+### Treatment
+unadj.colbytreat.pc23_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(2,3), color_by="Treatment") + 
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC2, y=PC3, fill=Treatment, color=Treatment)) +
+  scale_fill_manual(values=treat_colors) + 
+  scale_color_manual(values=treat_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Donor
+unadj.colbydonor.pc23_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(2,3), color_by="Donor", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC2, y=PC3, fill=Donor, color=Donor)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=donor_colors) + 
+  scale_color_manual(values=donor_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Day
+unadj.colbyday.pc23_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(2,3), color_by="Day", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC2, y=PC3, fill=Day, color=Day)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=day_colors) + 
+  scale_color_manual(values=day_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Condition
+unadj.colbycond.pc23_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(2,3), color_by="Day", shape_by="Donor") +
+  new_scale_color() +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC2, y=PC3, fill=Condition), color="black", size=4.5) +
+  scale_shape_manual(values=c(21,23,25)) +
+  scale_fill_manual(values=condition_colors) + 
+  scale_color_manual(values=condition_colors) + 
+  theme(legend.position = "none", 
+        legend.title=element_blank(),
+        axis.title=element_text(32, face="bold")) 
+
+
+
+## PC3 & 4
+### Treatment
+unadj.colbytreat.pc34_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(3,4), color_by="Treatment") + 
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC3, y=PC4, fill=Treatment, color=Treatment)) +
+  scale_fill_manual(values=treat_colors) + 
+  scale_color_manual(values=treat_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Donor
+unadj.colbydonor.pc34_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(3,4), color_by="Donor", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC3, y=PC4, fill=Donor, color=Donor)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=donor_colors) + 
+  scale_color_manual(values=donor_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Day
+unadj.colbyday.pc34_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(3,4), color_by="Day", shape_by="Treatment") +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC3, y=PC4, fill=Day, color=Day)) +
+  scale_shape_manual(values=c(21,25)) +
+  scale_fill_manual(values=day_colors) + 
+  scale_color_manual(values=day_colors) + 
+  theme(legend.position = "top", 
+        legend.title=element_blank(),
+        axis.title=element_text(24)) 
+
+### Condition
+unadj.colbycond.pc34_plt <- Plot2DPCA(unadj_pca.metadata, var=unadj_var, pcs=c(3,4), color_by="Day", shape_by="Donor") +
+  new_scale_color() +
+  geom_point(unadj_pca.metadata, mapping=aes(x=PC3, y=PC4, fill=Condition), color="black", size=4.5) +
+  scale_shape_manual(values=c(21,23,25)) +
+  scale_fill_manual(values=condition_colors) + 
+  scale_color_manual(values=condition_colors) + 
+  theme(legend.position = "none", 
+        legend.title=element_blank(),
+        axis.title=element_text(32, face="bold")) 
+
+
+# Rearrange layers
+unadj.colbycond.pc12_plt$layers[[1]] <- unadj.colbycond.pc12_plt$layers[[4]]
+unadj.colbycond.pc23_plt$layers[[1]] <- unadj.colbycond.pc23_plt$layers[[4]]
+unadj.colbycond.pc34_plt$layers[[1]] <- unadj.colbycond.pc34_plt$layers[[4]]
+
+```
+
+
+
+### Build custom legend
+
+```{r}
+
+setwd(qc_dir)
+png("pca.colbycondition.shapebydonor.legend.png", width=2500, height=500)
+par(mar = c(0.1, 3, 0.1, 3))
+plot(NULL, xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("left", 
+       legend = gsub("_", ": ", names(condition_colors)), 
+       pch=22, pt.cex=8, cex=5, bty='n', y.intersp=1.1, ncol=2, inset=c(0.025,0.5),
+       col = "black",
+       pt.bg = unname(condition_colors))
+legend("left", 
+       legend = names(donor_colors), 
+       pt.cex=8, cex=5, bty='n', y.intersp=1.1, ncol=1, inset=c(0.45, 0),
+       pch=c(2,1,5),
+       col = "black")
+mtext(c("Condition","Donor"), side=3, adj=c(0.035,0.5), padj=c(1.75,1.75), cex=8)
+dev.off()
+
+```
+
+
+
+```{r}
+
+# Save
+treat_plt <- unadj.colbytreat.pc12_plt / unadj.colbytreat.pc23_plt /  unadj.colbytreat.pc34_plt
+donor_plt <- unadj.colbydonor.pc12_plt /  unadj.colbydonor.pc23_plt /  unadj.colbydonor.pc34_plt
+day_plt <- unadj.colbyday.pc12_plt /  unadj.colbyday.pc23_plt /  unadj.colbyday.pc34_plt
+cond_plt <- unadj.colbycond.pc12_plt /  unadj.colbycond.pc23_plt
+
+# Save
+setwd(qc_dir)
+ggsave("pca.samples.colbytreat.png", treat_plt, units="px", width=2500, height=5500)
+ggsave("pca.samples.colbydonor.png", donor_plt, units="px", width=2500, height=5500)
+ggsave("pca.samples.colbyday.png", day_plt, units="px", width=2500, height=5500)
+ggsave("pca.samples.colbycondition.png", cond_plt, units="px", width=2500, height=2500)
+
+
+```
+
+
+
+### PVCA
+
+```{r}
+
+# Sort out metadata
+cov_mod.formatted <- new("AnnotatedDataFrame", data = metadata[,c("Donor","Day","Treatment")])
+
+# Expressionset data
+expr_unadj <- ExpressionSet(assayData = log2.tpm_rcm[,rownames(metadata)], phenoData = cov_mod.formatted)
+
+# Run PVCA
+pvca_unadj <- pvcaBatchAssess(abatch = expr_unadj, batch.factors = colnames(cov_mod.formatted@data), threshold = varexpl_thr)
+
+# Assemble to df
+pvca_unadj.df <- data.frame(as.data.frame(pvca_unadj$label), t(as.data.frame(pvca_unadj$dat)), Method="Un-adjusted")
+colnames(pvca_unadj.df) <- c("Effect", "Variance", "Method")
+
+```
+
+
+
+### Plot PVCA
+
+```{r}
+
+# Join
+pvca_df <- pvca_unadj.df
+pvca_df["Type"] <- "Single"
+pvca_df[grepl("[:]",pvca_df$Effect),]["Type"] <- "Int"
+
+# Remove duplicate raw
+pvca_df <- pvca_df[!duplicated(pvca_df[,c("Effect","Method")]),]
+
+# Define if raw/not raw
+pvca_df["Method_Group"] <- "Un-adjusted"
+
+# Visualise
+plt <- ggplot(pvca_df, aes(x=gsub("Z_","",Effect), y=Variance, fill=Method_Group)) + 
+  geom_bar(stat="identity", position="dodge") + scale_fill_manual(values=c(lighten("darkblue", 0.5))) +
+  facet_grid(cols=vars(Type), rows=vars(Method), space="free", scale="free") +
+  xlab("") + ylab("Variance") + ylim(0,0.6) +
+  theme_bw() + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5), legend.position = "top", legend.title=element_blank())
+
+# Save individual
+setwd(qc_dir)
+ggsave("pvca.barplot.png", plt, units="px", height=1250, width=1000)
+
+```
+
+
+
+### Get custom genes
+
+```{r}
+
+# Define custom genes of interest
+custom_genes <- c("SERPINA3","SERPINA1","SERPINB2","COL2A1","COL11A1","MATN3","ACAN","SOX9","COMP")
+
+```
+
+
+
+### SVA
+
+```{r}
+# Define design matrices
+mod <- model.matrix( ~ 0 + Donor + Day + Treatment, data=metadata)
+mod0 <- model.matrix(~ 1, data=metadata)
+
+# Estimate number of surrogate variable analyses
+n.sv = num.sv(log2.tpm_rcm[,rownames(metadata)], mod, method="leek")
+
+#no surrogate variables
+n.sv 
+
+```
+
+
+
+### Loop over days and run deseq2
+
+```{r}
+
+# Vector of days
+metadata$Day <- as.character(metadata$Day)
+days <- unique(metadata$Day)
+
+# Run day-wise comparisons
+ds2_treat.by_day <- RunGroupwiseDE(txi, metadata, gene_annot, group_col="Day", contrast=c("Treatment","KD","Control"), design_formula=" ~ Donor + Treatment", dir=deseq_dir)
+names(ds2_treat.by_day)
+
+# Get sig
+sig.ds2_treat.by_day <- lapply(ds2_treat.by_day, function(res) res[res$padj < de_padj_thr & !is.na(res$padj),])
+lapply(sig.ds2_treat.by_day, nrow)
+
+#function to get the number of up and down significantly differentially expressed genes
+getNumUpAndDown <- function(res,de_padj_thr,de_lfc_thr){
+  
+  res.sig <- res[res$padj < de_padj_thr & !is.na(res$padj),]
+  up <- nrow(res.sig[ res.sig$log2FoldChange >= de_lfc_thr,])
+  down <- nrow(res.sig[ res.sig$log2FoldChange <= -de_lfc_thr,])
+  
+  return(c(up=up,down=down))
+}
+
+
+sig_signed.ds2_treat.by_day <- lapply(ds2_treat.by_day,getNumUpAndDown,0.01,log2(2))
+
+
+degs_filename <- paste0(deseq_dir, "treatment_num_up_down_degs.txt")
+
+
+write.table(as.data.frame(sig_signed.ds2_treat.by_day), degs_filename, sep="\t", row.names=TRUE, quote=FALSE)
+
+
+
+```
+
+### Compare results to skeletalvis
+
+```{r}
+
+skeletalVisTable <- paste0(data_dir,"foldchangeTable.RDS")
+skeletalVisMetadata <- paste0(data_dir,"skeletalVisMetadata.txt")
+
+if(!file.exists(skeletalVisTable)) download.file("https://pgb.liv.ac.uk/~jsoul/DW/skeletalVisTable.RDS",skeletalVisTable)
+if(!file.exists(skeletalVisMetadata)) download.file("https://pgb.liv.ac.uk/~jsoul/DW/skeletalVisMetadata.txt",skeletalVisMetadata)
+
+skeletalVisTable <- readRDS(skeletalVisTable)
+skeletalVisMetadata <- read.delim(skeletalVisMetadata)
+
+skeletalVisSimilarity <- lapply(ds2_treat.by_day,runSkeletalVis,skeletalVisTable,skeletalVisMetadata)
+
+mapply(function(data,name) write.table(data,file=paste0(deseq_dir,name,"_skeletalvis.txt"), sep="\t", row.names=FALSE, quote=FALSE),skeletalVisSimilarity,names(skeletalVisSimilarity))
+
+
+```
+
+### Loop over treatments and run DESeq2
+
+```{r}
+
+# Run treat-wise comparisons comparing successive days
+day_comparisons <- list(c("Day","Day3","Day0"), c("Day","Day7","Day0"), c("Day","Day7","Day3"))
+ds2_day.by_treat <- lapply(day_comparisons, function(contrast)
+{
+  print(contrast)
+  res <- do.call("rbind",RunGroupwiseDE(txi, metadata, gene_annot, group_col="Treatment", contrast=contrast, design_formula=" ~ Day + Donor", dir=deseq_dir))
+  
+  # Make df
+  res <- cbind(res, data.frame(CONTRAST=paste(contrast, collapse="_")))
+  return(res)
+}); names(ds2_day.by_treat) <- unlist(lapply(day_comparisons, function(x) paste(x, collapse="_")))
+
+# Make df
+ds2_day.by_treat.df <- do.call("rbind",ds2_day.by_treat)
+
+# Set id
+ds2_day.by_treat.df["COMPARISON_ID"] <- paste(ds2_day.by_treat.df$GROUP, ds2_day.by_treat.df$CONTRAST, sep="-")
+
+```
+
+### Volcano plots
+
+```{r}
+
+# Plot KD vs Control by day
+NiceVolcanoPlots(do.call("rbind",ds2_treat.by_day), "GROUP", deseq_dir, de_padj_thr)
+
+# Plot consequent day comparisons
+NiceVolcanoPlots(ds2_day.by_treat.df, "COMPARISON_ID", deseq_dir, de_padj_thr,label_sig_thr=1e-50)
+
+```
+
+### Overlap and contrast KD vs Control
+
+```{r}
+
+# Loop over contrasts and compare KD/control
+ovlp_df <- do.call("rbind",lapply(unique(ds2_day.by_treat.df$CONTRAST), function(contrast) { 
+  
+  # Subset directory to get comparison of interest
+  cont_df <- ds2_day.by_treat.df[ds2_day.by_treat.df$CONTRAST == contrast,]
+  
+  # Get group dfs
+  g1_df <- cont_df[cont_df$GROUP == "Control",]; rownames(g1_df) <- g1_df$ENSG
+  g2_df <- cont_df[cont_df$GROUP == "KD",]; rownames(g2_df) <- g2_df$ENSG
+  
+  # Remove NA
+  g1_df <- g1_df[!is.na(g1_df$padj),]
+  g2_df <- g2_df[!is.na(g2_df$padj),]
+  
+  # Get t-value
+  g1_df["t"] <- g1_df$log2FoldChange / g1_df$lfcSE
+  g2_df["t"] <- g2_df$log2FoldChange / g2_df$lfcSE
+  
+  # Get sig
+  sig.g1_df <- g1_df[g1_df$padj < de_padj_thr,]
+  sig.g2_df <- g2_df[g2_df$padj < de_padj_thr,]
+  
+  # Get intersection/union
+  int <- length(intersect(sig.g1_df$ENSG, sig.g2_df$ENSG))
+  uni <- length(union(sig.g1_df$ENSG, sig.g2_df$ENSG))
+  jsi <- int / uni
+  
+  # Get correlation in LFCs and padjs
+  ## All genes
+  padj_corr <- cor(g1_df[intersect(g1_df$ENSG, g2_df$ENSG),]$padj, g2_df[intersect(g1_df$ENSG, g2_df$ENSG),]$padj, method="pearson")
+  log2fc_corr <- cor(g1_df[intersect(g1_df$ENSG, g2_df$ENSG),]$log2FoldChange, g2_df[intersect(g1_df$ENSG, g2_df$ENSG),]$log2FoldChange, method="pearson")
+  t_corr <- cor(g1_df[intersect(g1_df$ENSG, g2_df$ENSG),]$t, g2_df[intersect(g1_df$ENSG, g2_df$ENSG),]$t, method="pearson")
+  
+  ## intersection of common genes
+  sig.padj_corr <- cor(sig.g1_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$padj, sig.g2_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$padj, method="pearson")
+  sig.log2fc_corr <- cor(sig.g1_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$log2FoldChange, sig.g2_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$log2FoldChange, method="pearson")
+  sig.t_corr <- cor(sig.g1_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$t, sig.g2_df[intersect(sig.g1_df$ENSG, sig.g2_df$ENSG),]$t, method="pearson")
+  
+  # Assemble output
+  out_df <- data.frame(
+                       CONTRAST=contrast,
+                       CONTROL=nrow(sig.g1_df),
+                       KS=nrow(sig.g2_df),
+                       INTERSECT=int,
+                       UNION=uni,
+                       JSI=jsi,
+                       PADJ_CORR=padj_corr,
+                       LOG2FC_CORR=log2fc_corr,
+                       T_CORR=t_corr,
+                       SIG_PADJ_CORR=sig.padj_corr,
+                       SIG_LOG2FC_CORR=sig.log2fc_corr,
+                       SIG_T_CORR=sig.t_corr
+  )
+  
+  # Return
+  return(out_df)
+}))
+  
+# Save as table
+save_name <- paste0(deseq_dir, "deseq2_comparison_summarystats.tsv")
+write.table(ovlp_df, save_name, sep="\t", row.names=FALSE)
+
+```
+
+
+
+### Plot overlaps
+
+```{r}
+
+# Make tall
+tall.ovlp_df <- melt(ovlp_df, id.vars=c("CONTRAST","CONTROL","KS"))
+tall.ovlp_df$CONTRAST <- mgsub::mgsub(tall.ovlp_df$CONTRAST,c("Day_","_"),c(""," vs "))
+
+# Relevel factors
+tall.ovlp_df$CONTRAST <- factor(tall.ovlp_df$CONTRAST, levels=c("Day3 vs Day0","Day7 vs Day3","Day7 vs Day0"))
+tall.ovlp_df$variable <- factor(tall.ovlp_df$variable, levels=c("JSI","PADJ_CORR","LOG2FC_CORR","T_CORR","SIG_PADJ_CORR","SIG_LOG2FC_CORR","SIG_T_CORR","INTERSECT","UNION"))
+
+# 
+jsi_plt <- ggplot(tall.ovlp_df[grepl("JSI",tall.ovlp_df$variable),], aes(x=CONTRAST, y=value)) + 
+  geom_bar(stat="identity") +  xlab("") + ylab("Jaccard Similarity Index") +
+  facet_grid(cols=vars(gsub("_CORR","",variable))) +
+  ylim(0,1) +
+  theme_bw() + theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=0))
+corr_plt <- ggplot(tall.ovlp_df[grepl("CORR",tall.ovlp_df$variable),], aes(x=CONTRAST, y=value)) + 
+  geom_bar(stat="identity") +  xlab("") + ylab("Pearson's r") +
+  facet_grid(cols=vars(gsub("_CORR","",variable))) +
+  ylim(0,1) +
+  theme_bw() + theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=0))
+
+# Save
+setwd(deseq_dir)
+ggsave("daywise_treat_comparisons.summary_stats.png", jsi_plt + corr_plt + plot_layout(widths = c(1, 6)), units="px", height=1500, width=3500)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+### GEVA
+
+#### Filtering
+
+```{r}
+
+# Assembly object
+ginput <- geva.merge.input(ds2_treat.by_day, col.values = "log2FoldChange", col.pvals = "padj", na.val = NA, col.other = "ENSG")
+
+# Removes the rows containing missing and infinite values
+ginput <- geva.input.correct(ginput)
+
+# Removes the rows that are entirely composed by insignificant values
+ginput <- geva.input.filter(ginput, p.value.cutoff = de_padj_thr)
+
+```
+
+
+
+#### Quantiles
+
+```{r}
+
+# Summarizes ginput to find the SV points
+gsummary <- geva.summarize(ginput, summary.method="mean", summary.variance="sd")
+
+# Calculates the quantiles from a GEVASummary object
+gquants <- geva.quantiles(gsummary, initial.thresholds = c(S=0.75, V=0.75))
+
+# Plot and save
+setwd(geva_dir)
+png("geva_quantiles.png", width=1000, height=650, units="px")
+plot(gquants)
+dev.off()
+
+```
+
+
+
+### Clusters
+
+```{r}
+
+# Run clustering wrapper
+res_param <- 0.40
+gcluster <- geva.cluster(gsummary,
+                         cluster.method="hierarchical",
+                         distance.method="euclidean",
+                         resolution=res_param)
+
+# Plot
+setwd(geva_dir)
+png("geva_clusters.png", width=1000, height=650, units="px")
+plot(gcluster)
+dev.off()
+
+```
+
+
+
+### Get variable genes
+
+```{r}
+
+# Example with GEVASummary
+factors(gsummary) <- names(ds2_treat.by_day)
+
+# Calculates the final classifications based on the
+gresults <- geva.finalize(gsummary, gcluster, gquants)
+results_df <- results.table(gresults)
+rownames(results_df) <- ginput@ftable$ENSG
+
+# Plot sig results
+setwd(geva_dir)
+png("geva_adjusted_quantiles.png", width=1000, height=650, units="px")
+plot(gresults)
+dev.off()
+
+```
+
+
+
+### Get genes
+
+```{r}
+
+# View results
+table(results_df$classification)
+
+# Make df of S and V values
+summ_lfc <- data.frame(NAME=ginput@ftable$ENSG, log2FoldChange=gresults@svdata$S, V=gresults@svdata$V)
+# summ_lfc <- summ_lfc[which(summ_lfc$NAME %in% rownames(results_df[results_df$classification != "basal",])),]
+
+# Merge with gene_annot and results 
+summ_lfc <- merge(gene_annot[which(gene_annot$ENSG %in% summ_lfc$NAME),], summ_lfc, by.x="ENSG", by.y="NAME")
+results_df <- merge(summ_lfc, results_df, by.x="ENSG", by.y="row.names")
+
+# Save
+geva_filename <- paste0(geva_dir, "geva_final_results.gene_classification.deseq2_de_result_comparison.tsv")
+write.table(results_df, geva_filename, sep="\t", quote=FALSE)
+
+```
+
+
+
+### Get gene-wise expression
+
+```{r}
+
+# Get as genes
+gene_rcm <- merge(gene_annot, txi$abundance, by.x="ENSG", by.y="row.names")
+gene_rcm <- aggregate(. ~ SYMBOL, data=gene_rcm[,!grepl("ENSG|ENST|ENTZ|BIOTYPE|GENENAME|ENTREZID|GENETYPE",colnames(gene_rcm))], FUN=mean)
+rownames(gene_rcm) <- gene_rcm$SYMBOL; gene_rcm <- gene_rcm[,-1]
+
+```
+
+
+
+### Get sparse & similar genes
+
+```{r}
+
+# Get sparse genes
+sparse_genes <- unique(results_df[results_df$classification == "sparse",]$SYMBOL)
+similar_genes <- unique(results_df[results_df$classification == "similar",]$SYMBOL)
+sparse_genes[which(sparse_genes %in% custom_genes | grepl("SERPIN",sparse_genes))]
+similar_genes[which(similar_genes %in% custom_genes | grepl("SERPIN",similar_genes))]
+
+```
+
+
+
+### Save GEVA results
+
+```{r}
+
+# Save GEVA
+setwd(geva_dir)
+saveRDS(list(FINAL=results_df, CLUSTER=gcluster, QUANTILES=gquants, SUMMARY=gsummary, GENESETS=list(SPARSE=unique(gene_annot[which(gene_annot$SYMBOL %in% sparse_genes),]$ENSG), SIMILAR=unique(gene_annot[which(gene_annot$SYMBOL %in% similar_genes),]$ENSG))),
+        paste0(study_id, ".geva_results.rds"))
+
+```
+
+
+
+### Get sparse/similar RCMs and save
+
+```{r}
+
+# Get sparse genes matrix
+sparse_rcm <- gene_rcm[sparse_genes,]
+similar_rcm <- gene_rcm[similar_genes,]
+custom_rcm <- gene_rcm[custom_genes,]
+
+# Save
+sparse_filename <- paste0(geva_dir,"sparse_genes.kallisto.tpmexpr_matrix.tsv")
+similar_filename <- paste0(geva_dir,"similar_genes.kallisto.tpmexpr_matrix.tsv")
+custom_filename <- paste0(geva_dir,"custom_genes.kallisto.tpmexpr_matrix.tsv")
+write.table(data.frame(GENE=rownames(sparse_rcm), sparse_rcm), sparse_filename, sep="\t", quote=FALSE)
+write.table(data.frame(GENE=rownames(similar_rcm), similar_rcm), similar_filename, sep="\t", quote=FALSE)
+write.table(data.frame(GENE=rownames(custom_rcm), custom_rcm), custom_filename, sep="\t", quote=FALSE)
+
+```
+
+
+
+### Prep for heatmaps
+
+```{r}
+
+# Toggle for bad filenames
+if (study_id == "DW_E36_120123_Osteogenesis") { 
+    
+  lfc.sparse_rcm <- as.matrix(log2( (sparse_rcm[,c(paste0("KD_Day0_", 1:3), paste0("KD_Day3_", 1:3), paste0("KD_Day7_", 1:3))] + 0.01) / (sparse_rcm[,c(paste0("Control_Day0_", 1:3), paste0("Control_Day3_", 1:3), paste0("Control_Day7_", 1:3))] + 0.01) ))
+  lfc.custom_rcm <- as.matrix(log2( (custom_rcm[,c(paste0("KD_Day0_", 1:3), paste0("KD_Day3_", 1:3), paste0("KD_Day7_", 1:3))] + 0.01) / (custom_rcm[,c(paste0("Control_Day0_", 1:3), paste0("Control_Day3_", 1:3), paste0("Control_Day7_", 1:3))] + 0.01) ))
+
+} else {
+  
+  # Get as enrichment
+  lfc.sparse_rcm <- as.matrix(log2( (sparse_rcm[,c(paste0("Day0_KD_", 1:3), paste0("Day3_KD_", 1:3), paste0("Day7_KD_", 1:3))] + 0.01) / (sparse_rcm[,c(paste0("Day0_Control_", 1:3), paste0("Day3_Control_", 1:3), paste0("Day7_Control_", 1:3))] + 0.01) ))
+  lfc.custom_rcm <- as.matrix(log2( (custom_rcm[,c(paste0("Day0_KD_", 1:3), paste0("Day3_KD_", 1:3), paste0("Day7_KD_", 1:3))] + 0.01) / (custom_rcm[,c(paste0("Day0_Control_", 1:3), paste0("Day3_Control_", 1:3), paste0("Day7_Control_", 1:3))] + 0.01) ))
+  
+}
+
+# Order metadata
+kd_metadata <- metadata[colnames(lfc.sparse_rcm),]
+
+# Gene annotations
+sparse_gene_annot <- gene_annot[which(gene_annot$SYMBOL %in% sparse_genes),]
+custom_gene_annot <- gene_annot[which(gene_annot$SYMBOL %in% custom_genes),]
+sparse_gene_annot <- sparse_gene_annot[!duplicated(sparse_gene_annot$SYMBOL),]
+custom_gene_annot <- custom_gene_annot[!duplicated(custom_gene_annot$SYMBOL),]
+rownames(sparse_gene_annot) <- sparse_gene_annot$SYMBOL
+rownames(custom_gene_annot) <- custom_gene_annot$SYMBOL
+
+
+```
+
+
+
+### Custom legend
+
+```{r}
+
+# Color function
+col_fun <- circlize::colorRamp2(c(-12,0,12), c("blue","white", "red"))
+
+# Color function
+scaled.col_fun <- circlize::colorRamp2(c(-3,0,3), c("blue","white", "red"))
+
+# Make legends
+lgd <- Legend(col_fun = col_fun, title = "Log2 FC", title_gp = gpar(fontsize=20, fontface="bold"), labels_gp = gpar(fontsize=16), legend_width = unit(16, "cm"), direction = "horizontal")
+scaled.lgd <- Legend(col_fun = scaled.col_fun, title = "Z Score", title_gp = gpar(fontsize=20, fontface="bold"), labels_gp = gpar(fontsize=16), legend_width = unit(16, "cm"), direction = "horizontal")
+
+# Save
+setwd(geva_dir)
+png("log2FC.for_heatmaps.legend.png", width=1500, height=200, units="px")
+draw(lgd)
+dev.off()
+
+# Save
+setwd(geva_dir)
+png("Zscaled_log2FC.for_heatmaps.legend.png", width=1500, height=200, units="px")
+draw(scaled.lgd)
+dev.off()
+
+```
+
+
+
+### Heatmap (sparse genes)
+
+```{r}
+
+# Column colours
+hmap <- Heatmap(lfc.sparse_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_sparse_genes.log2_heatmap.groupbyday.png", units="px", width=1500, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(lfc.sparse_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_sparse_genes.log2_heatmap.groupbydonor.png", units="px", width=1500, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.sparse_rcm))),
+                
+        # Cell colours
+        na_col = "grey",
+        col = scaled.col_fun,
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_sparse_genes.z_log2_heatmap.groupbyday.png", units="px", width=1500, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.sparse_rcm))),
+                
+        # Cell colours
+        na_col = "grey",
+        col = scaled.col_fun,
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_sparse_genes.z_log2_heatmap.groupbydonor.png", units="px", width=1500, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+
+```
+
+
+
+### Heatmap (custom genes)
+
+```{r}
+
+# Color function
+col_fun <- circlize::colorRamp2(c(-12,0,6), c("blue","white", "red"))
+
+# Column colours
+hmap <- Heatmap(lfc.custom_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_custom_genes.log2_heatmap.groupbyday.png", units="px", width=1500, height=650)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(lfc.custom_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_custom_genes.log2_heatmap.groupbydonor.png", units="px", width=1500, height=650)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.custom_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_custom_genes.z_log2_heatmap.groupbyday.png", units="px", width=1500, height=650)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.custom_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        show_heatmap_legend = FALSE,
+
+        # Labels
+        column_labels = gsub("_"," ",kd_metadata$Sample),
+        row_names_gp = gpar(fontsize = 20),
+        column_names_gp = gpar(fontsize = 32),
+        column_title_gp = gpar(fontsize=42, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor], simple_anno_size = unit(2, "cm")),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day], simple_anno_size = unit(2, "cm")), 
+                                             annotation_name_gp= gpar(fontsize = 32)),
+)
+
+# Save
+setwd(geva_dir)
+png("geva_custom_genes.z_log2_heatmap.groupbydonor.png", units="px", width=1500, height=650)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+```
+
+### Read in reactome annotations
+
+```{r}
+
+
+# Read in GMT
+react <- read.gmt("https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.5.1/c2.cp.reactome.v7.5.1.entrez.gmt")
+
+# Convert ENTZ to ENSG
+pathways <- merge(gene_annot[,c("ENSG","ENTREZID")], react, by.x="ENTREZID", by.y="gene")
+
+```
+
+
+
+### Convert to list (for GSEA)
+
+```{r}
+
+ont_db_names <- c("REACTOME")
+if (file.exists(paste0(annot_dir,"nongo_ont_term.db_",paste(ont_db_names , collapse="-"),".list.rds")))
+{
+  
+  # Read in
+  print(">>>>> READING IN OTHER  TERM LISTS")
+  pathway.list <- readRDS(paste0(annot_dir,"nongo_ont_term.db_",paste(ont_db_names , collapse="-"),".list.rds"))
+  
+} else {
+  
+  # Make gene list in correct format
+  pathway.list <- lapply(unique(pathways$term), function(ont_id) pathways[pathways$term == ont_id,]$ENSG)
+  names(pathway.list) <- unique(pathways$term)
+  pathway.list <- list(REACTOME=pathway.list)
+
+  # Save
+  saveRDS(pathway.list, paste0(annot_dir,"nongo_ont_term.db_",paste(ont_db_names , collapse="-"),".list.rds"))
+}
+
+```
+
+
+
+### Gene Ontology
+
+```{r}
+
+# Run GSEA
+## KD vs Control
+unfiltered_gsea.day0 <- RunGSEA(genes=ds2_treat.by_day[["Day0"]], database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day0", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day0_sig_thr, id="Day0")
+unfiltered_gsea.day3 <- RunGSEA(genes=ds2_treat.by_day[["Day3"]], database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day3", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day3_sig_thr, id="Day3")
+unfiltered_gsea.day7 <- RunGSEA(genes=ds2_treat.by_day[["Day7"]], database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day7", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day7_sig_thr, id="Day7")
+
+## Day comparison
+### KD
+kd_gsea.day3_vs_0 <- RunGSEA(genes=ds2_day.by_treat[["Day_Day3_Day0"]][ds2_day.by_treat[["Day_Day3_Day0"]]$GROUP == "KD",], 
+                             database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day_Day3_Day0", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day0_sig_thr, id="KD-Day3_vs_Day0")
+kd_gsea.day7_vs_0 <- RunGSEA(genes=ds2_day.by_treat[["Day_Day7_Day0"]][ds2_day.by_treat[["Day_Day7_Day0"]]$GROUP == "KD",], 
+                             database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day_Day7_Day0", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day0_sig_thr, id="KD-Day7_vs_Day0")
+
+### Control
+control_gsea.day3_vs_0 <- RunGSEA(genes=ds2_day.by_treat[["Day_Day3_Day0"]][ds2_day.by_treat[["Day_Day3_Day0"]]$GROUP == "Control",], 
+                                  database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day_Day3_Day0", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day0_sig_thr, id="Control-Day3_vs_Day0")
+control_gsea.day7_vs_0 <- RunGSEA(genes=ds2_day.by_treat[["Day_Day7_Day0"]][ds2_day.by_treat[["Day_Day7_Day0"]]$GROUP == "Control",], 
+                                  database_names=c("REACTOME"), db_list=pathway.list, id_col="ENSG", stat_col="log2FoldChange", group_col="GROUP", group_name="Day_Day7_Day0", minimum_gs=min_gs, dir=pathway_dir, alpha_thr=day0_sig_thr, id="Control-Day7_vs_Day0")
+
+# Filter to get sig
+sig.gsea.day0 <- unfiltered_gsea.day0[unfiltered_gsea.day0$padj < day0_sig_thr,]
+sig.gsea.day3 <- unfiltered_gsea.day3[unfiltered_gsea.day3$padj < day3_sig_thr,]
+sig.gsea.day7 <- unfiltered_gsea.day7[unfiltered_gsea.day7$padj < day7_sig_thr,]
+
+```
+
+
+
+### Plot
+
+```{r}
+
+# Plot
+day3_plt <- ggplot(sig.gsea.day3, aes(x=NES, y=gsub("REACTOME_","",pathway), fill=-log10(padj), size=size)) + 
+  geom_vline(xintercept=0, linetype="dashed", color="grey") +
+  geom_point(shape=21) + scale_fill_gradient(high="#F55536", low="#FFBFB2")
+  ylab("") +
+  theme_bw(base_size=16) 
+day7_plt <- ggplot(sig.gsea.day7, aes(x=NES, y=gsub("REACTOME_","",pathway), fill=-log10(padj), size=size)) + 
+  geom_point(shape=21) + scale_fill_gradient(high="#F55536", low="#FFBFB2") + 
+  ylab("") +
+  theme_bw(base_size=16) 
+
+# Save
+setwd(pathway_dir)
+ggsave("day3.fgsea_reatctome.dotplots.png", day3_plt, units="px", height=3500, width=6500)
+ggsave("day7.fgsea_reatctome.dotplots.png", day7_plt, units="px", height=1500, width=3500)
+
+```
+
+
+
+### DESeq2 LRT
+
+```{r}
+
+# Create dds object from Txi
+dds.dayintact_lrt <- DESeqDataSetFromTximport(txi, colData = metadata[colnames(txi$counts),], ~ Donor + Day + Treatment + Day:Treatment)
+dds.donorintact_lrt <- DESeqDataSetFromTximport(txi, colData = metadata[colnames(txi$counts),], ~ Donor + Day + Treatment + Donor:Treatment)
+dds.daydonorintact_lrt <- DESeqDataSetFromTximport(txi, colData = metadata[colnames(txi$counts),], ~ Donor + Day + Treatment + Donor:Day)
+
+# Run DESeq2
+dds.dayintact_lrt  <- DESeq(dds.dayintact_lrt, test="LRT", reduced= ~ Donor + Day + Treatment)
+dds.donorintact_lrt  <- DESeq(dds.donorintact_lrt, test="LRT", reduced= ~ Donor + Day + Treatment)
+dds.daydonorintact_lrt  <- DESeq(dds.daydonorintact_lrt, test="LRT", reduced= ~ Donor + Day + Treatment)
+
+# Add annotation
+dds.dayintact_lrt.res.df <- merge(gene_annot, data.frame(results(dds.dayintact_lrt)), by.x="ENSG", by.y="row.names")
+dds.donorintact_lrt.res.df <- merge(gene_annot, data.frame(results(dds.donorintact_lrt)), by.x="ENSG", by.y="row.names")
+dds.daydonorintact_lrt.res.df <- merge(gene_annot, data.frame(results(dds.daydonorintact_lrt)), by.x="ENSG", by.y="row.names")
+
+# Add grouping
+dds.dayintact_lrt.res.df["GROUPING"] <- "LRT: Treat:Day"
+dds.donorintact_lrt.res.df["GROUPING"] <- "LRT: Treat:Donor"
+dds.daydonorintact_lrt.res.df["GROUPING"] <- "LRT: Day:Donor"
+
+# Get sig
+sig.dds.dayintact_lrt.res.df <- dds.dayintact_lrt.res.df[dds.dayintact_lrt.res.df$padj < de_lrt.pval_thr & !is.na(dds.dayintact_lrt.res.df$padj),]
+sig.dds.donorintact_lrt.res.df <- dds.donorintact_lrt.res.df[dds.donorintact_lrt.res.df$padj < de_lrt.pval_thr & !is.na(dds.donorintact_lrt.res.df$padj),]
+sig.dds.daydonorintact_lrt.res.df <- dds.daydonorintact_lrt.res.df[dds.daydonorintact_lrt.res.df$padj < de_lrt.pval_thr & !is.na(dds.daydonorintact_lrt.res.df$padj),]
+
+# Get lrt genes
+lrt_dayintact.genes <- sig.dds.dayintact_lrt.res.df$ENSG
+lrt_donorintact.genes <- sig.dds.donorintact_lrt.res.df$ENSG
+lrt_daydonorintact.genes <- sig.dds.daydonorintact_lrt.res.df$ENSG
+
+```
+
+
+
+### Get LRT gene count matrices
+
+```{r}
+
+# Get lrt rcm
+lrt_dayintact.rcm <- txi$abundance[lrt_dayintact.genes,]
+lrt_donorintact.rcm <- txi$abundance[lrt_donorintact.genes,]
+lrt_daydonorintact.rcm <- txi$abundance[lrt_daydonorintact.genes,]
+
+# Toggle for bad filenames
+if (study_id == "DW_E36_120123_Osteogenesis") { 
+  
+  lfc.dayintact_rcm <- as.matrix(log2( (lrt_dayintact.rcm[,c(paste0("KD_Day0_", 1:3), paste0("KD_Day3_", 1:3), paste0("KD_Day7_", 1:3))] + 0.01) / 
+                                       (lrt_dayintact.rcm[,c(paste0("Control_Day0_", 1:3), paste0("Control_Day3_", 1:3), paste0("Control_Day7_", 1:3))] + 0.01) ))
+  lfc.donorintact_rcm <- as.matrix(log2( (lrt_donorintact.rcm[,c(paste0("KD_Day0_", 1:3), paste0("KD_Day3_", 1:3), paste0("KD_Day7_", 1:3))] + 0.01) / 
+                                         (lrt_donorintact.rcm[,c(paste0("Control_Day0_", 1:3), paste0("Control_Day3_", 1:3), paste0("Control_Day7_", 1:3))] + 0.01) ))
+  lfc.daydonorintact_rcm <- as.matrix(log2( (lrt_daydonorintact.rcm[,c(paste0("KD_Day0_", 1:3), paste0("KD_Day3_", 1:3), paste0("KD_Day7_", 1:3))] + 0.01) / 
+                                            (lrt_daydonorintact.rcm[,c(paste0("Control_Day0_", 1:3), paste0("Control_Day3_", 1:3), paste0("Control_Day7_", 1:3))] + 0.01) ))
+
+} else {
+  
+  lfc.dayintact_rcm <- as.matrix(log2( (lrt_dayintact.rcm[,c(paste0("Day0_KD_", 1:3), paste0("Day3_KD_", 1:3), paste0("Day7_KD_", 1:3))] + 0.01) / 
+                                       (lrt_dayintact.rcm[,c(paste0("Day0_Control_", 1:3), paste0("Day3_Control_", 1:3), paste0("Day7_Control_", 1:3))] + 0.01) ))
+  lfc.donorintact_rcm <- as.matrix(log2( (lrt_donorintact.rcm[,c(paste0("Day0_KD_", 1:3), paste0("Day3_KD_", 1:3), paste0("Day7_KD_", 1:3))] + 0.01) / 
+                                         (lrt_donorintact.rcm[,c(paste0("Day0_Control_", 1:3), paste0("Day3_Control_", 1:3), paste0("Day7_Control_", 1:3))] + 0.01) ))
+  lfc.daydonorintact_rcm <- as.matrix(log2( (lrt_daydonorintact.rcm[,c(paste0("Day0_KD_", 1:3), paste0("Day3_KD_", 1:3), paste0("Day7_KD_", 1:3))] + 0.01) / 
+                                            (lrt_daydonorintact.rcm[,c(paste0("Day0_Control_", 1:3), paste0("Day3_Control_", 1:3), paste0("Day7_Control_", 1:3))] + 0.01) ))
+
+}
+
+# Get to gene
+rownames(lfc.dayintact_rcm) <- gene_annot[rownames(lfc.dayintact_rcm),]$SYMBOL
+rownames(lfc.donorintact_rcm) <- gene_annot[rownames(lfc.donorintact_rcm),]$SYMBOL
+rownames(lfc.daydonorintact_rcm) <- gene_annot[rownames(lfc.daydonorintact_rcm),]$SYMBOL
+
+```
+
+
+
+### Heatmaps
+
+#### LRT Day:Treat
+
+```{r}
+
+# Color function
+col_fun <- circlize::colorRamp2(c(min(lfc.dayintact_rcm),0,max(lfc.dayintact_rcm)), c("blue","white", "red"))
+
+# Column colours
+hmap <- Heatmap(lfc.dayintact_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Log2 Fold-Change",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.treatday_intact_genes.log2_heatmap.groupbyday.png", units="px", width=750, height=1000)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(lfc.dayintact_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Log2 Fold-Change",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.treatday_intact_genes.log2_heatmap.groupbydonor.png", units="px", width=750, height=1000)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.dayintact_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Z score",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.treatday_intact_genes.z_log2_heatmap.groupbyday.png", units="px", width=750, height=1000)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.dayintact_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Z score",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.treatday_intact_genes.z_log2_heatmap.groupbydonor.png", units="px", width=750, height=1000)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+```
+
+
+
+#### LRT Day:Treat
+
+```{r}
+
+if (nrow(lfc.donorintact_rcm) > 0 ) {
+  # Color function
+  col_fun <- circlize::colorRamp2(c(min(lfc.donorintact_rcm),0,max(lfc.donorintact_rcm)), c("blue","white", "red"))
+  
+  # Column colours
+  hmap <- Heatmap(lfc.donorintact_rcm,
+          
+          # Cell colours
+          na_col = "grey",
+          col = col_fun,
+          
+          # Split
+          column_split = kd_metadata$Day,
+          row_split = 2,
+  
+          # set up legend
+          heatmap_legend_param = list(title="Log2 Fold-Change",
+                                      direction = "horizontal",
+                                      title_position = "topcenter",
+                                      max=12, min=0,
+                                      legend_height = unit(4, "cm")),
+          # Row labels
+          row_names_gp = gpar(fontsize = 10),
+          bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                               `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+  )
+  
+  # Save
+  setwd(deseq_dir)
+  png("lrt.treatdonor_intact_genes.log2_heatmap.groupbyday.png", units="px", width=750, height=1000)
+  draw(hmap,  heatmap_legend_side = "top")
+  dev.off()
+  
+  # Column colours
+  hmap <- Heatmap(lfc.donorintact_rcm,
+          
+          # Cell colours
+          na_col = "grey",
+          col = col_fun,
+          
+          # Split
+          column_split = kd_metadata$Donor,
+          row_split = 2,
+  
+          # set up legend
+          heatmap_legend_param = list(title="Log2 Fold-Change",
+                                      direction = "horizontal",
+                                      title_position = "topcenter",
+                                      max=12, min=0,
+                                      legend_height = unit(4, "cm")),
+          # Row labels
+          row_names_gp = gpar(fontsize = 10),
+          bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                               `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+  )
+  
+  # Save
+  setwd(deseq_dir)
+  png("lrt.treatdonor_intact_genes.log2_heatmap.groupbydonor.png", units="px", width=750, height=1000)
+  draw(hmap,  heatmap_legend_side = "top")
+  dev.off()
+  
+  # Column colours
+  hmap <- Heatmap(t(scale(t(lfc.donorintact_rcm))),
+          
+          # Cell colours
+          na_col = "grey",
+          
+          # Split
+          column_split = kd_metadata$Day,
+          row_split = 2,
+  
+          # set up legend
+          heatmap_legend_param = list(title="Z score",
+                                      direction = "horizontal",
+                                      title_position = "topcenter",
+                                      max=12, min=0,
+                                      legend_height = unit(4, "cm")),
+          # Row labels
+          row_names_gp = gpar(fontsize = 10),
+          bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                               `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+  )
+  
+  # Save
+  setwd(deseq_dir)
+  png("lrt.treatdonor_intact_genes.z_log2_heatmap.groupbyday.png", units="px", width=750, height=1000)
+  draw(hmap,  heatmap_legend_side = "top")
+  dev.off()
+  
+  # Column colours
+  hmap <- Heatmap(t(scale(t(lfc.donorintact_rcm))),
+          
+          # Cell colours
+          na_col = "grey",
+          
+          # Split
+          column_split = kd_metadata$Donor,
+          row_split = 2,
+  
+          # set up legend
+          heatmap_legend_param = list(title="Z score",
+                                      direction = "horizontal",
+                                      title_position = "topcenter",
+                                      max=12, min=0,
+                                      legend_height = unit(4, "cm")),
+          # Row labels
+          row_names_gp = gpar(fontsize = 10),
+          bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                               `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+  )
+  
+  # Save
+  setwd(deseq_dir)
+  png("lrt.treatdonor_intact_genes.z_log2_heatmap.groupbydonor.png", units="px", width=750, height=1000)
+  draw(hmap,  heatmap_legend_side = "top")
+  dev.off()
+
+}
+
+```
+
+
+
+#### LRT Day:Treat
+
+```{r}
+
+# Color function
+col_fun <- circlize::colorRamp2(c(min(lfc.daydonorintact_rcm),0,max(lfc.daydonorintact_rcm)), c("blue","white", "red"))
+
+# Column colours
+hmap <- Heatmap(lfc.daydonorintact_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Log2 Fold-Change",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.daydonor_intact_genes.log2_heatmap.groupbyday.png", units="px", width=750, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(lfc.daydonorintact_rcm,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Log2 Fold-Change",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.daydonor_intact_genes.log2_heatmap.groupbydonor.png", units="px", width=750, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.daydonorintact_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Day,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Z score",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.daydonor_intact_genes.z_log2_heatmap.groupbyday.png", units="px", width=750, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+# Column colours
+hmap <- Heatmap(t(scale(t(lfc.daydonorintact_rcm))),
+        
+        # Cell colours
+        na_col = "grey",
+        
+        # Split
+        column_split = kd_metadata$Donor,
+        row_split = 2,
+
+        # set up legend
+        heatmap_legend_param = list(title="Z score",
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    max=12, min=0,
+                                    legend_height = unit(4, "cm")),
+        # Row labels
+        row_names_gp = gpar(fontsize = 10),
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(kd_metadata$Donor, col=donor_colors[kd_metadata$Donor]),
+                                             `Day` = anno_simple(kd_metadata$Day, col=day_colors[kd_metadata$Day]))
+)
+
+# Save
+setwd(deseq_dir)
+png("lrt.daydonor_intact_genes.z_log2_heatmap.groupbydonor.png", units="px", width=750, height=2500)
+draw(hmap,  heatmap_legend_side = "top")
+dev.off()
+
+```
+
+
+
+
+### Custom heatmap
+
+```{r}
+
+chosenGenes <- read.delim(paste0(meta_dir,"GOI.txt"))
+chosenGenes$Cat <- relevel(as.factor(chosenGenes$Cat),"KD")
+
+
+
+chosenGeneExp <- log2(gene_rcm[ which(rownames(gene_rcm) %in% chosenGenes$Gene),]+1)
+
+metadata <- metadata[order(metadata$Day,metadata$Treatment,metadata$Donor),]
+
+
+# Order metadata
+chosenGeneExp <- chosenGeneExp[chosenGenes$Gene,metadata$Sample]
+mat_scaled = t(scale(t(chosenGeneExp)))
+
+# Color function
+col_fun <- circlize::colorRamp2(c(-2,0,3), c("blue","white", "red"))
+
+columnLabels <- gsub("_\\d+","",metadata$Sample)
+columnLabels <- gsub("Control","Ctrl",columnLabels)
+
+# Column colours
+hmap <- Heatmap(mat_scaled,
+        
+        # Cell colours
+        na_col = "grey",
+        col = col_fun,
+        
+        # Split
+        column_split = metadata$Treatment,
+        row_split = chosenGenes$Cat,
+        row_title_gp = gpar(fontsize = 22),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+
+        # set up legend
+        show_heatmap_legend = TRUE,
+         heatmap_legend_param = list(
+    title="Z-Score",
+    legend_direction = "horizontal",
+    legend_position = "topcenter",
+    title_position = "topcenter",
+    title_gp = gpar(fontsize = 20), 
+     labels_gp = gpar(fontsize = 18),
+    grid_height = unit(1, "cm"), legend_width= unit(6, "cm")),
+
+        # Labels
+        column_labels = columnLabels,
+        row_names_gp = gpar(fontsize = 22),
+        column_names_gp = gpar(fontsize = 20),
+        column_title_gp = gpar(fontsize=28, fontface="bold"),
+        
+        # Annotations
+        bottom_annotation = columnAnnotation(`Donor` = anno_simple(metadata$Donor, col=donor_colors[metadata$Donor], simple_anno_size = unit(1, "cm")),
+                                             `Day` = anno_simple(metadata$Day, col=day_colors[metadata$Day], simple_anno_size = unit(1, "cm")), `Treatment` = anno_simple(metadata$Treatment, col=treat_colors[metadata$Treatment], simple_anno_size = unit(1, "cm")),
+                                             annotation_name_gp= gpar(fontsize = 20)),
+    
+    # right_annotation = rowAnnotation(fo=anno_text(1:9))
+        
+        
+        
+)
+
+# Save
+setwd(geva_dir)
+png("customHeatmap.png", units="in", width=8, height=10,res=600)
+draw(hmap, heatmap_legend_side = "top", annotation_legend_side = "bottom")
+dev.off()
+
+
+```
+
+
+

@@ -1,0 +1,6 @@
+Gene	Cat
+SERPINA3	KD
+COL1A1	Osteogenesis
+ALPL	Osteogenesis
+THY1	MSC
+CD44	MSC

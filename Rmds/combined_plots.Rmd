@@ -1,0 +1,236 @@
+---
+title: "Combined plotting"
+author: "Euan McDonnell"
+date: '2023-02-23'
+output: pdf_document
+---
+
+
+### Parameters
+
+```{r}
+
+# Which experiement
+chondro_id <- "DW_E36_120123_Chondrogenesis"
+osteo_id <- "DW_E36_120123_Osteogenesis"
+
+# PVCA variance explained threshold
+varexpl_thr <- 0.7
+
+# Differential expression
+de_lrt.pval_thr <- 0.01
+de_padj_thr <- 0.01
+
+# Ontology
+min_gs <- 5
+
+```
+
+
+
+### Directories
+
+```{r}
+
+library(mgsub)
+
+# Define base directory
+base_dir <- paste0(getwd(), "/../")
+data_dir <- paste0(base_dir, study_id, "/data/")
+res_dir <- paste0(base_dir, study_id, "/results/")
+meta_dir <- paste0(data_dir, "metadata/")
+expr_dir <- paste0(data_dir, "expr/")
+qc_dir <- paste0(res_dir, "qc/")
+deseq_dir <- paste0(res_dir, "deseq2/")
+geva_dir <- paste0(res_dir, "geva/")
+pathway_dir <- paste0(res_dir, "pathway/")
+annot_dir <- paste0(data_dir, "annot/")
+script_dir <- paste0(base_dir, "extra_scripts/")
+joint_dir <- paste0(base_dir, "joint_analysis/")
+
+# Make directories
+lapply(c(res_dir, meta_dir, expr_dir, qc_dir, geva_dir, deseq_dir, pathway_dir, annot_dir, script_dir, joint_dir), function(dir) { dir.create(dir, showWarnings = FALSE, recursive = TRUE) })
+lapply(c(res_dir, meta_dir, expr_dir, qc_dir, geva_dir, deseq_dir, pathway_dir, annot_dir, script_dir), function(dir) { dir.create(mgsub(dir, c("Osteo","Chondro"), c("Chondro","Osteo")), showWarnings = FALSE, recursive = TRUE) })
+
+```
+
+
+
+### Source
+
+```{r}
+
+setwd(script_dir)
+source(list.files(pattern=".*.R", path=script_dir))
+
+```
+
+
+
+### Read in data
+
+```{r}
+
+# Read in expression data
+setwd(mgsub(expr_dir, c("Osteo"), c("Chondro")))
+chondro.txi <- readRDS(paste0(chondro_id,"_txi.RDS"))
+setwd(mgsub(expr_dir, c("Chondro"), c("Osteo")))
+osteo.txi <- readRDS(paste0(osteo_id,"_txi.RDS"))
+
+# Read in counts data
+setwd(meta_dir)
+metadata <- read.table("sample_metadata.tsv", sep="\t", header=TRUE)
+metadata <- read.table("sample_metadata.tsv", sep="\t", header=TRUE)
+
+# Add columns for metadata
+metadata["Day"] <- gsub("_.*","",metadata$Condition)
+metadata["Treatment"] <- gsub(".*_","",metadata$Condition)
+metadata["Replicate"] <- gsub(".*_","",metadata$Sample)
+
+# Add patient/treatment colours
+metadata["TreatDonor"] <- paste(metadata$Donor, metadata$Treatment, sep="-")
+rownames(metadata) <- metadata$Sample
+
+```
+
+
+
+### Define colours
+
+Partial colourblind friendly, based off of Paul Tol's blog post: https://personal.sron.nl/~pault/
+
+```{r}
+
+library(colorspace)
+
+# Day
+day_colors <- c("#FEE391", "#EC7014", "#662506")
+names(day_colors) <- c("Day0","Day3","Day7")
+
+# Donor
+donor_colors <- c("#0077BB","#009988","#EE3377")
+names(donor_colors) <- unique(metadata$Donor)
+
+# Treatment
+treat_colors <- c("#DDAA33","#004488")
+names(treat_colors) <- c("KD","Control")
+
+# Treat day colors
+condition_colors <- c(lighten("#FEE391",0.35),lighten("#EC7014",0.35), lighten("#662506",0.35), darken("#FEE391",0.25),darken("#EC7014",0.25), darken("#662506",0.25))
+names(condition_colors) <- unique(metadata$Condition)
+
+# Biotype colors
+bio_colors <- c("lncRNA"=lighten("darkred",0.5), "protein_coding"=lighten("darkblue",0.5), "pseudogene"=lighten("darkgreen",0.5))
+
+# GEVA colors
+geva_colors <- list(basal="darkgrey", Up_similar="red", Down_similar="blue", Up_sparse="darkred", Down_sparse="darkblue")
+
+```
+
+
+
+### Read in GEVA results
+
+```{r}
+
+# Save GEVA
+setwd(mgsub(geva_dir, c("Osteo"), c("Chondro")))
+chondro_geva <- readRDS(paste0(chondro_id, ".geva_results.rds"))
+setwd(mgsub(geva_dir, c("Chonro"), c("Osteo")))
+osteo_geva <- readRDS(paste0(osteo_id, ".geva_results.rds"))
+
+```
+
+
+
+### Final results
+
+```{r}
+
+# Get results dfs
+chondro_df <- data.frame(chondro_geva$FINAL, STUDY="Chondrogenesis")
+osteo_df <- data.frame(osteo_geva$FINAL, STUDY="Osteogenesis")
+
+# Change colnames
+colnames(chondro_df)[grepl("log2Fold|^V$",colnames(chondro_df))] <- c("Mean", "SD")
+colnames(osteo_df)[grepl("log2Fold|^V$",colnames(osteo_df))] <- c("Mean", "SD")
+
+# add up/down-reg sprase/basal
+chondro_df$classification[grepl("sparse", chondro_df$classification) & chondro_df$Mean > 0] <- paste0("Up_",chondro_df$classification[grepl("sparse", chondro_df$classification) & chondro_df$Mean > 0])
+chondro_df$classification[grepl("sparse", chondro_df$classification) & chondro_df$Mean < 0] <- paste0("Down_",chondro_df$classification[grepl("sparse", chondro_df$classification) & chondro_df$Mean < 0])
+chondro_df$classification[grepl("similar", chondro_df$classification) & chondro_df$Mean > 0] <- paste0("Up_",chondro_df$classification[grepl("similar", chondro_df$classification) & chondro_df$Mean > 0])
+chondro_df$classification[grepl("similar", chondro_df$classification) & chondro_df$Mean < 0] <- paste0("Down_",chondro_df$classification[grepl("similar", chondro_df$classification) & chondro_df$Mean < 0])
+
+osteo_df$classification[grepl("sparse", osteo_df$classification) & osteo_df$Mean > 0] <- paste0("Up_",osteo_df$classification[grepl("sparse", osteo_df$classification) & osteo_df$Mean > 0])
+osteo_df$classification[grepl("sparse", osteo_df$classification) & osteo_df$Mean < 0] <- paste0("Down_",osteo_df$classification[grepl("sparse", osteo_df$classification) & osteo_df$Mean < 0])
+osteo_df$classification[grepl("similar", osteo_df$classification) & osteo_df$Mean > 0] <- paste0("Up_",osteo_df$classification[grepl("similar", osteo_df$classification) & osteo_df$Mean > 0])
+osteo_df$classification[grepl("similar", osteo_df$classification) & osteo_df$Mean < 0] <- paste0("Down_",osteo_df$classification[grepl("similar", osteo_df$classification) & osteo_df$Mean < 0])
+
+# Join
+joint_df <- rbind(chondro_df, osteo_df)
+
+```
+
+
+
+### Plot GEVA
+
+#### Quantles
+
+```{r}
+
+# Manuall set quantiles
+quant.joint_df <- joint_df
+quant.joint_df$classification[quant.joint_df$Mean > 0.75] <- "Up_similar"
+quant.joint_df$classification[quant.joint_df$Mean < -0.75] <- "Down_similar"
+quant.joint_df$classification[quant.joint_df$Mean > 0.75 & quant.joint_df$SD > 0.75] <- "Up_sparse"
+quant.joint_df$classification[quant.joint_df$Mean < -0.75 & quant.joint_df$SD > 0.75] <- "Down_sparse"
+
+
+plt <- ggplot(quant.joint_df, aes(x=Mean, y=SD, color=classification)) + 
+  geom_point(size=4, shape=1) + 
+  geom_hline(yintercept=0.75, linetype="dashed", color="black") +
+  geom_vline(xintercept=0.75, linetype="dashed", color="black") +
+  geom_vline(xintercept=-0.75, linetype="dashed", color="black") +
+  facet_grid(cols=vars(STUDY)) + 
+  xlim(floor(min(joint_df$Mean)), 0-floor(min(joint_df$Mean))) + ylim(0, max(joint_df$SD)) +
+  scale_color_manual(values=geva_colors, labels=c("Basal", "Similar (Up)", "Similar (Down)", "Sparse (Up)", "Sparse (Down)")) + 
+  theme_bw(base_size=24) + theme(axis.title = element_text(size=42), 
+                                 strip.text.x = element_text(size = 24, face = "bold"),
+                                 legend.position=c(0.935,0.875),
+                                 legend.box.background = element_rect(colour = "black")) + 
+                           guides(fill=guide_legend(title="Classification"))
+
+# Save
+setwd(joint_dir)
+ggsave("quantile.geva_results.png", plt, width=8000, height=3500, units="px")
+
+```
+
+
+
+
+#### Final
+
+```{r}
+
+plt <- ggplot(joint_df, aes(x=Mean, y=SD, color=classification)) + 
+  geom_point(size=4, shape=1) + 
+  geom_hline(yintercept=0.75, linetype="dashed", color="black") +
+  geom_vline(xintercept=0.75, linetype="dashed", color="black") +
+  geom_vline(xintercept=-0.75, linetype="dashed", color="black") +
+  facet_grid(cols=vars(STUDY)) + 
+  xlim(floor(min(joint_df$Mean)), 0-floor(min(joint_df$Mean))) + ylim(0, max(joint_df$SD)) +
+  scale_color_manual(values=geva_colors, labels=c("Basal", "Similar (Up)", "Similar (Down)", "Sparse (Up)", "Sparse (Down)")) + 
+  theme_bw(base_size=24) + theme(axis.title = element_text(size=42), 
+                                 strip.text.x = element_text(size = 24, face = "bold"),
+                                 legend.position=c(0.935,0.875),
+                                 legend.box.background = element_rect(colour = "black")) + 
+                           guides(color=guide_legend(title="Classification"))
+
+# Save
+setwd(joint_dir)
+ggsave("final.geva_results.png", plt, width=8000, height=3500, units="px")
+
+```
+

@@ -1,0 +1,10 @@
+Gene	Cat
+SERPINA3	KD
+COL2A1	Chondrogenesis
+ACAN	Chondrogenesis
+SOX9	Chondrogenesis
+MATN3	Chondrogenesis
+COL9A1	Chondrogenesis
+COL11A1	Chondrogenesis
+THY1	MSC
+CD44	MSC
