@@ -8,7 +8,7 @@ Comparative analysis of SERPINA3 knock-down in Chondrogenesis and Osteogenesis R
 Requires singularity to be [installed](https://apptainer.org/docs/admin/main/installation.html) 
 ```
 #download the data and code
-git clone https://github.com/CBFLivUni/d.wilk_serpins.git
+git clone https://github.com/CBFLivUni/SERPINA3Chondrogenesis.git
 
 #move the downloaded repositry 
 cd d.wilk_serpins
