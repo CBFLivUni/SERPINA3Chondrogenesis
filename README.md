@@ -47,7 +47,4 @@ Rscript runAnalysis.R
  
 * ```Rmds``` contains the R markdown (.Rmd) file used to analyses the gene expression data (post-Nextflow pipeline).
 * ```extra_scripts``` contains helper functions in R scripts for the .Rmd document(s).
-* ```manuscript``` contains documents for the manuscript (figures, section texts etc).
-* ```notes``` contains notes on meetings, the subject area and methods etc.
-* ```presentatons``` contains presentations given internally and to the collaborator.
 * ```install``` provides the installation script for the needed R libraries
